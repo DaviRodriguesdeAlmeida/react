@@ -4,13 +4,12 @@ on:
   push:
     branches:
       - build-treino-mission-android
-  pull_request:
-    branches:
-      - main
+    paths-ignore:
+      - 'treino-mission-build-output/**'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -18,50 +17,85 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: build-treino-mission-android
 
-      - name: Rebuild Android source archive
+      - name: Rebuild and validate Android source archive
+        id: source
         shell: bash
         run: |
-          set -euo pipefail
-          cat treino-mission-build/part_00.b64 treino-mission-build/part_01.b64 | tr -d '[:space:]' | base64 -d > /tmp/treino-mission-android.zip
-          echo "bdb40fea3b37cab00f69cbc7b29ec363d3ab579def4c22bde5e188f88003c894  /tmp/treino-mission-android.zip" | sha256sum -c -
-          mkdir -p /tmp/treino-mission-src
-          unzip -q /tmp/treino-mission-android.zip -d /tmp/treino-mission-src
-          echo "PROJECT_DIR=/tmp/treino-mission-src/android-build-min" >> "$GITHUB_ENV"
+          set -u
+          mkdir -p treino-mission-build-output /tmp/treino-mission-src
+          cat treino-mission-build/part_00.b64 treino-mission-build/part_01.b64 | tr -d '[:space:]' | base64 -d > /tmp/treino-mission-android.zip || true
+          actual="$(sha256sum /tmp/treino-mission-android.zip | awk '{print $1}')"
+          expected="bdb40fea3b37cab00f69cbc7b29ec363d3ab579def4c22bde5e188f88003c894"
+          echo "source_sha256=$actual" > treino-mission-build-output/source-check.txt
+          if [ "$actual" = "$expected" ]; then
+            unzip -q /tmp/treino-mission-android.zip -d /tmp/treino-mission-src
+            echo "PROJECT_DIR=/tmp/treino-mission-src/android-build-min" >> "$GITHUB_ENV"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "SOURCE_HASH_FAILED expected=$expected actual=$actual" > treino-mission-build-output/status.txt
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up JDK 17
+        if: steps.source.outputs.ok == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Set up Android SDK
+        if: steps.source.outputs.ok == 'true'
         uses: android-actions/setup-android@v3
 
       - name: Install Android SDK 35
+        if: steps.source.outputs.ok == 'true'
         shell: bash
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - name: Set up Gradle
+        if: steps.source.outputs.ok == 'true'
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
       - name: Build debug APK
+        id: gradlebuild
+        if: steps.source.outputs.ok == 'true'
+        continue-on-error: true
         shell: bash
         run: |
+          set -o pipefail
           cd "$PROJECT_DIR"
-          gradle --no-daemon assembleDebug
+          gradle --no-daemon assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/treino-mission-build-output/build.log"
 
-      - name: Rename APK
+      - name: Prepare result
+        if: always()
         shell: bash
         run: |
-          cp "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" "$RUNNER_TEMP/Treino-Mission-v1.0-Android.apk"
+          if [ "${{ steps.source.outputs.ok }}" != "true" ]; then
+            : # status already written
+          elif [ "${{ steps.gradlebuild.outcome }}" = "success" ]; then
+            cp "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" treino-mission-build-output/Treino-Mission-v1.0-Android.apk
+            echo "SUCCESS" > treino-mission-build-output/status.txt
+            sha256sum treino-mission-build-output/Treino-Mission-v1.0-Android.apk > treino-mission-build-output/apk-sha256.txt
+          else
+            echo "GRADLE_BUILD_FAILED" > treino-mission-build-output/status.txt
+          fi
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Treino-Mission-v1.0-Android
-          path: ${{ runner.temp }}/Treino-Mission-v1.0-Android.apk
-          if-no-files-found: error
-          retention-days: 7
+      - name: Commit build result to temporary branch
+        if: always()
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f treino-mission-build-output
+          git commit -m "[skip ci] Treino Mission Android build result" || true
+          git push origin HEAD:build-treino-mission-android
+
+      - name: Mark failed build
+        if: steps.source.outputs.ok != 'true' || steps.gradlebuild.outcome == 'failure'
+        shell: bash
+        run: exit 1
